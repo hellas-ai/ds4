@@ -81,7 +81,7 @@ static int tp_err(char *err, size_t errlen, const char *fmt, ...) {
 }
 
 static int tp_send_exact(int fd, const void *buf, size_t n) {
-    const char *p = buf;
+    const char *p = (const char *)buf;
     while (n) {
         ssize_t r = write(fd, p, n);
         if (r <= 0) return -1;
@@ -91,7 +91,7 @@ static int tp_send_exact(int fd, const void *buf, size_t n) {
 }
 
 static int tp_recv_exact(int fd, void *buf, size_t n) {
-    char *p = buf;
+    char *p = (char *)buf;
     while (n) {
         ssize_t r = read(fd, p, n);
         if (r <= 0) return -1;
@@ -177,7 +177,7 @@ static int tp_rank0_bootstrap(ds4_tp_ctx *tp, const ds4_tp_options *opt,
 #else
     const uint32_t n_workers = opt->tp_size - 1;
     tp->n_peers = n_workers;
-    tp->peer_fds = calloc(n_workers, sizeof(int));
+    tp->peer_fds = (int *)calloc(n_workers, sizeof(int));
     if (!tp->peer_fds) return tp_err(err, errlen, "TP: alloc peer_fds");
 
     int listen_fd = tp_listen(opt->bootstrap_port);
@@ -258,7 +258,7 @@ static int tp_rankN_bootstrap(ds4_tp_ctx *tp, const ds4_tp_options *opt,
     return tp_err(err, errlen, "TP requires ROCm/RCCL");
 #else
     tp->n_peers = 1;
-    tp->peer_fds = calloc(1, sizeof(int));
+    tp->peer_fds = (int *)calloc(1, sizeof(int));
     if (!tp->peer_fds) return tp_err(err, errlen, "TP: alloc peer_fds");
 
     /* Retry connect for up to 30 seconds — rank 0 may not be ready yet. */
@@ -309,7 +309,7 @@ int ds4_tp_ctx_create(ds4_tp_ctx **out, const ds4_tp_options *opt,
     if (!out || !opt) return tp_err(err, errlen, "ds4_tp_ctx_create: null arg");
     *out = NULL;
 
-    ds4_tp_ctx *tp = calloc(1, sizeof(*tp));
+    ds4_tp_ctx *tp = (ds4_tp_ctx *)calloc(1, sizeof(*tp));
     if (!tp) return tp_err(err, errlen, "ds4_tp_ctx_create: alloc");
 
     tp->enabled = opt->enabled;
