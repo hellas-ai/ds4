@@ -449,6 +449,8 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
 
     fprintf(stderr, "ds4-tp: rank %u worker loop started\n", tp->rank);
 
+    int pos_before_draft = 0;  /* position saved at start of DRAFT batch */
+
     for (;;) {
         ds4_tp_frame hdr;
         if (tp_recv_frame(fd, &hdr, buf, sizeof(buf)) < 0) {
@@ -470,7 +472,8 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
             ds4_tp_draft_step step;
             if (hdr.bytes != sizeof(step)) break;
             memcpy(&step, buf, sizeof(step));
-            /* Evaluate each draft token. */
+            /* Save position so ACCEPT can roll back correctly. */
+            pos_before_draft = ds4_session_pos(sess);
             char eval_err[256] = {0};
             for (uint32_t i = 0; i < step.n_draft && i < 8; i++) {
                 ds4_session_eval(sess, step.tokens[i], eval_err, sizeof(eval_err));
@@ -481,12 +484,10 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
             ds4_tp_accept accept;
             if (hdr.bytes != sizeof(accept)) break;
             memcpy(&accept, buf, sizeof(accept));
-            /* Roll back session to accepted prefix length.
-             * pos after accept = pos_before_draft + n_accepted */
-            int cur_pos = ds4_session_pos(sess);
-            int accepted_pos = cur_pos - (int)(/* n_draft evaluated */ 2) + (int)accept.n_accepted;
-            if (accepted_pos < cur_pos)
-                ds4_session_rewind(sess, accepted_pos);
+            /* Rewind to pos_before_draft + n_accepted tokens of draft. */
+            int target = pos_before_draft + (int)accept.n_accepted;
+            if (target < ds4_session_pos(sess))
+                ds4_session_rewind(sess, target);
             break;
         }
         case DS4_TP_MSG_RESET:

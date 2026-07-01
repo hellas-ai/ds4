@@ -23064,6 +23064,10 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     return ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
 }
 
+ds4_tp_ctx *ds4_engine_tp(ds4_engine *e) {
+    return e ? e->tp : NULL;
+}
+
 const ds4_tokens *ds4_session_tokens(ds4_session *s) {
     return s ? &s->checkpoint : NULL;
 }
@@ -25697,7 +25701,10 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         s->mtp_draft_valid = false;
         const int suffix = prompt->len - s->checkpoint.len;
         const uint32_t resume_min = metal_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_min) {
+        /* TP: disable batched prefill — use token-by-token so workers stay in
+         * lockstep via TOKEN broadcasts in ds4_session_eval_internal. */
+        if (suffix > 0 && (uint32_t)suffix >= resume_min &&
+            !ds4_tp_enabled(s->graph.tp)) {
             bool cancelled = false;
             ds4_sync_progress progress = {
                 .session = s,
@@ -25744,16 +25751,24 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                 s->mtp_draft_valid = false;
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
-                                                (uint32_t)prompt->v[i],
-                                                (uint32_t)s->checkpoint.len,
-                                                s->logits))
-            {
-                snprintf(err, errlen, "%s decode failed while extending checkpoint", backend_name);
-                s->checkpoint_valid = false;
-                return 1;
+            if (ds4_tp_enabled(s->graph.tp)) {
+                /* TP: go through eval_internal so TOKEN is broadcast to workers. */
+                if (ds4_session_eval_internal(s, prompt->v[i], false, err, errlen) != 0) {
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+            } else {
+                if (!metal_graph_eval_token_raw_swa(&s->graph, &e->model, &e->weights,
+                                                    (uint32_t)prompt->v[i],
+                                                    (uint32_t)s->checkpoint.len,
+                                                    s->logits))
+                {
+                    snprintf(err, errlen, "%s decode failed while extending checkpoint", backend_name);
+                    s->checkpoint_valid = false;
+                    return 1;
+                }
+                token_vec_push(&s->checkpoint, prompt->v[i]);
             }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
         }
         return 0;
     }
@@ -25766,7 +25781,23 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
     }
-    if (s->prefill_cap < (uint32_t)prompt->len) {
+    if (ds4_tp_enabled(s->graph.tp)) {
+        /* TP: token-by-token cold-start prefill via eval_internal so TOKEN
+         * messages are broadcast to workers at each step. */
+        for (int i = 0; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                s->checkpoint_valid = s->checkpoint.len > 0;
+                s->mtp_draft_valid = false;
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (ds4_session_eval_internal(s, prompt->v[i], false, err, errlen) != 0) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+        }
+        ok = true;
+    } else if (s->prefill_cap < (uint32_t)prompt->len) {
         bool cancelled = false;
         ds4_sync_progress progress = {
             .session = s,
@@ -25807,8 +25838,11 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         s->checkpoint_valid = false;
         return 1;
     }
-    ds4_tokens_copy(&s->checkpoint, prompt);
-    s->checkpoint_valid = true;
+    if (!ds4_tp_enabled(s->graph.tp)) {
+        /* TP path already called eval_internal which updates the checkpoint. */
+        ds4_tokens_copy(&s->checkpoint, prompt);
+        s->checkpoint_valid = true;
+    }
     s->mtp_draft_valid = false;
     s->graph.mtp_n_raw = 0;
     return 0;
@@ -25986,6 +26020,17 @@ int ds4_session_set_logits(ds4_session *s, const float *logits, int n) {
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+    /* TP rank 0: broadcast token to worker ranks so they run the same eval.
+     * Workers have rank > 0 so they skip this and just run the eval locally. */
+    if (ds4_tp_enabled(s->graph.tp) && ds4_tp_rank(s->graph.tp) == 0) {
+        char tp_err[256];
+        if (ds4_tp_broadcast_token(s->graph.tp, (int32_t)token,
+                                   (uint32_t)s->checkpoint.len,
+                                   tp_err, sizeof(tp_err)) != 0) {
+            snprintf(err, errlen, "TP TOKEN broadcast: %s", tp_err);
+            return 1;
+        }
+    }
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -26091,6 +26136,15 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         char *err, size_t errlen) {
     if (!s || max_tokens <= 0 || accepted_cap <= 0) return 0;
     if (s->distributed) {
+        if (!accepted) return 0;
+        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
+        accepted[0] = first_token;
+        return 1;
+    }
+    /* TP mode: speculation requires broadcasting draft state to workers — not
+     * yet implemented.  Fall back to single-token eval so the allreduce in
+     * the layer eval still runs correctly on all nodes. */
+    if (ds4_tp_enabled(s->graph.tp)) {
         if (!accepted) return 0;
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;

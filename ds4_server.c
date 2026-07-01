@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_tp.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
 #include "rax.h"
@@ -8766,6 +8767,14 @@ static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
     ds4_kvstore_restore_suppressed_continued(kc, old_tokens, suppressed_tokens);
 }
 
+static void server_tp_broadcast_reset(server *s) {
+    ds4_tp_ctx *tp = ds4_engine_tp(s->engine);
+    if (!ds4_tp_enabled(tp)) return;
+    char tp_err[256];
+    if (ds4_tp_broadcast_reset(tp, tp_err, sizeof(tp_err)) != 0)
+        server_log(DS4_LOG_WARNING, "ds4-tp: RESET broadcast failed: %s", tp_err);
+}
+
 static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
     if (!s || !path) return;
     if (unlink(path) == 0) {
@@ -8778,6 +8787,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
                    path, strerror(errno));
     }
     s->kv.continued_last_store_tokens = 0;
+    server_tp_broadcast_reset(s);
     ds4_session_invalidate(s->session);
 }
 
@@ -9862,7 +9872,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         ds4_tokens effective = {0};
         int loaded = kv_cache_try_load_text(s, rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
-        if (loaded == 0) ds4_session_invalidate(s->session);
+        if (loaded == 0) { server_tp_broadcast_reset(s); ds4_session_invalidate(s->session); }
 
         char sync_err[160] = {0};
         const ds4_tokens *sync_prompt = loaded > 0 ? &effective : &canonical;
@@ -10603,6 +10613,7 @@ decode_again:
                 finish = "stop";
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
+                server_tp_broadcast_reset(s);
                 ds4_session_invalidate(s->session);
                 stop_decode = true;
                 break;
@@ -11447,6 +11458,14 @@ static void log_context_memory(ds4_backend backend,
 }
 
 static void server_close_resources(server *s) {
+    /* Notify TP workers to exit before we destroy the engine. */
+    if (s->engine) {
+        ds4_tp_ctx *tp = ds4_engine_tp(s->engine);
+        if (ds4_tp_enabled(tp)) {
+            char tp_err[256];
+            ds4_tp_broadcast_shutdown(tp, tp_err, sizeof(tp_err));
+        }
+    }
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -11709,6 +11728,17 @@ int main(int argc, char **argv) {
         int rc = ds4_dist_run(engine, &cfg.engine.distributed, &gen);
         ds4_engine_close(engine);
         return rc;
+    }
+    if (ds4_tp_enabled(ds4_engine_tp(engine))) {
+        if (ds4_tp_rank(ds4_engine_tp(engine)) > 0) {
+            char tp_err[256];
+            int rc = ds4_tp_worker_run(ds4_engine_tp(engine), engine,
+                                       tp_err, sizeof(tp_err));
+            if (rc != 0)
+                server_log(DS4_LOG_DEFAULT, "ds4-tp: worker error: %s", tp_err);
+            ds4_engine_close(engine);
+            return rc;
+        }
     }
 
     ds4_session *session = NULL;
