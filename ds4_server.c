@@ -11671,6 +11671,28 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = parse_backend_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
+        } else if (!strcmp(arg, "--tp-rank")) {
+            c.engine.tp.rank = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.tp.enabled = true;
+        } else if (!strcmp(arg, "--tp-size")) {
+            c.engine.tp.tp_size = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.tp.enabled = true;
+        } else if (!strcmp(arg, "--tp-bootstrap")) {
+            /* Format: host:port */
+            const char *val = need_arg(&i, argc, argv, arg);
+            const char *colon = strrchr(val, ':');
+            if (!colon || colon == val) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --tp-bootstrap requires host:port");
+                exit(2);
+            }
+            static char tp_host_buf[256];
+            size_t hlen = (size_t)(colon - val);
+            if (hlen >= sizeof(tp_host_buf)) hlen = sizeof(tp_host_buf) - 1;
+            memcpy(tp_host_buf, val, hlen);
+            tp_host_buf[hlen] = '\0';
+            c.engine.tp.bootstrap_host = tp_host_buf;
+            c.engine.tp.bootstrap_port = parse_int_arg(colon + 1, "--tp-bootstrap port");
+            c.engine.tp.enabled = true;
         } else {
             server_log(DS4_LOG_DEFAULT, "ds4-server: unknown option: %s", arg);
             usage(stderr, NULL);

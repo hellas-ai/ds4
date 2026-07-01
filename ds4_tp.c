@@ -322,11 +322,16 @@ int ds4_tp_ctx_create(ds4_tp_ctx **out, const ds4_tp_options *opt,
         return 0;
     }
 
+    /* Apply defaults. */
+    ds4_tp_options eff = *opt;
+    if (eff.bootstrap_port == 0) eff.bootstrap_port = 54321;
+    if (!eff.bootstrap_host || !eff.bootstrap_host[0]) eff.bootstrap_host = "127.0.0.1";
+
     int rc;
-    if (opt->rank == 0)
-        rc = tp_rank0_bootstrap(tp, opt, err, errlen);
+    if (eff.rank == 0)
+        rc = tp_rank0_bootstrap(tp, &eff, err, errlen);
     else
-        rc = tp_rankN_bootstrap(tp, opt, err, errlen);
+        rc = tp_rankN_bootstrap(tp, &eff, err, errlen);
 
     if (rc < 0) { free(tp->peer_fds); free(tp); return rc; }
     *out = tp;
