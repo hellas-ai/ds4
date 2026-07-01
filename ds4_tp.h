@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * Tensor parallelism for DS4 on multi-node Strix Halo clusters.
  *
@@ -123,5 +127,9 @@ int ds4_tp_broadcast_accept(ds4_tp_ctx *tp, uint32_t n_accepted,
                             int32_t next_token, char *err, size_t errlen);
 int ds4_tp_broadcast_reset(ds4_tp_ctx *tp, char *err, size_t errlen);
 int ds4_tp_broadcast_shutdown(ds4_tp_ctx *tp, char *err, size_t errlen);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
 
 #endif /* DS4_TP_H */
