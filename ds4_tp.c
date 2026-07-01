@@ -13,7 +13,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "ds4_tp.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
 #include "ds4.h"
+#ifdef __cplusplus
+}
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
