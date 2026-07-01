@@ -11755,7 +11755,7 @@ int main(int argc, char **argv) {
         if (ds4_tp_rank(ds4_engine_tp(engine)) > 0) {
             char tp_err[256];
             int rc = ds4_tp_worker_run(ds4_engine_tp(engine), engine,
-                                       tp_err, sizeof(tp_err));
+                                       cfg.ctx_size, tp_err, sizeof(tp_err));
             if (rc != 0)
                 server_log(DS4_LOG_DEFAULT, "ds4-tp: worker error: %s", tp_err);
             ds4_engine_close(engine);

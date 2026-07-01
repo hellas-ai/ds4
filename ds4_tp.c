@@ -437,7 +437,7 @@ int ds4_tp_broadcast_shutdown(ds4_tp_ctx *tp, char *err, size_t errlen) {
 /* ── worker loop (ranks 1..N-1) ──────────────────────────────────────────── */
 
 int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
-                      char *err, size_t errlen) {
+                      int ctx_size, char *err, size_t errlen) {
     if (!tp || !tp->enabled || tp->rank == 0)
         return tp_err(err, errlen, "ds4_tp_worker_run: not a worker rank");
 
@@ -445,10 +445,8 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
     ds4_session *sess = NULL;
     uint8_t buf[256];
 
-    /* Create a session for inference. Workers don't have an HTTP server;
-     * they just follow rank 0's TOKEN/DRAFT/ACCEPT/RESET messages. */
-    const int default_ctx = 8192;
-    if (ds4_session_create(&sess, engine, default_ctx) != 0) {
+    if (ctx_size <= 0) ctx_size = 8192;
+    if (ds4_session_create(&sess, engine, ctx_size) != 0) {
         return tp_err(err, errlen, "TP worker: session create failed");
     }
 
@@ -470,7 +468,13 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
             memcpy(&step, buf, sizeof(step));
             /* Evaluate the token (layer eval will do RCCL allreduce internally). */
             char eval_err[256] = {0};
-            ds4_session_eval(sess, step.token, eval_err, sizeof(eval_err));
+            if (ds4_session_eval(sess, step.token, eval_err, sizeof(eval_err)) != 0) {
+                fprintf(stderr, "ds4-tp: rank %u TOKEN eval error: %s\n", tp->rank, eval_err);
+#if DS4_TP_HAVE_RCCL
+                ncclCommAbort(tp->comm);  /* unblock other ranks stuck in allreduce */
+#endif
+                goto done;
+            }
             break;
         }
         case DS4_TP_MSG_DRAFT: {
@@ -481,7 +485,13 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
             pos_before_draft = ds4_session_pos(sess);
             char eval_err[256] = {0};
             for (uint32_t i = 0; i < step.n_draft && i < 8; i++) {
-                ds4_session_eval(sess, step.tokens[i], eval_err, sizeof(eval_err));
+                if (ds4_session_eval(sess, step.tokens[i], eval_err, sizeof(eval_err)) != 0) {
+                    fprintf(stderr, "ds4-tp: rank %u DRAFT eval error: %s\n", tp->rank, eval_err);
+#if DS4_TP_HAVE_RCCL
+                    ncclCommAbort(tp->comm);
+#endif
+                    goto done;
+                }
             }
             break;
         }

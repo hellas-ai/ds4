@@ -3446,7 +3446,8 @@ static void weights_validate_layout(
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
-        bool               require_output) {
+        bool               require_output,
+        bool               tp_shard) {
     const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -3460,14 +3461,14 @@ static void weights_validate_layout(
     }
 
     if (require_token_embd && !w->token_embd) ds4_die("required token embedding tensor is missing");
-    if (w->token_embd) {
+    if (!tp_shard && w->token_embd) {
         tensor_expect_layout(w->token_embd, DS4_TENSOR_F16, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
     const bool have_output = weights_have_output_head(w);
     if (require_output && !have_output) ds4_die("required output head tensors are missing");
     if (weights_have_partial_output_head(w) && !have_output) ds4_die("partial output head in GGUF");
-    if (have_output) {
+    if (!tp_shard && have_output) {
         tensor_expect_layout(w->output_hc_base,  DS4_TENSOR_F32,  1, DS4_N_HC, 0, 0);
         tensor_expect_layout(w->output_hc_fn,    DS4_TENSOR_F16,  2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(w->output_hc_scale, DS4_TENSOR_F32,  1, 1, 0, 0);
@@ -3482,6 +3483,7 @@ static void weights_validate_layout(
             fprintf(stderr, "ds4: required tensors for layer %u are missing\n", il);
             exit(1);
         }
+        if (tp_shard) continue;  /* dim checks skipped for TP shard GGUFs */
 
         tensor_expect_layout(l->hc_attn_fn,     DS4_TENSOR_F16,  2, hc_dim, hc_mix_dim, 0);
         tensor_expect_layout(l->hc_attn_scale,  DS4_TENSOR_F32,  1, 3, 0, 0);
@@ -3972,7 +3974,8 @@ static void weights_bind(
         uint32_t         load_layer_start,
         uint32_t         load_layer_end,
         bool             require_output,
-        bool             optional_output) {
+        bool             optional_output,
+        bool             tp_shard) {
     memset(w, 0, sizeof(*w));
 
     uint32_t start = 0;
@@ -4000,7 +4003,7 @@ static void weights_bind(
         weights_bind_layer(&w->layer[il], m, il);
     }
 
-    weights_validate_layout(w, start, end, require_token_embd, require_output);
+    weights_validate_layout(w, start, end, require_token_embd, require_output, tp_shard);
 }
 
 typedef struct {
@@ -10883,7 +10886,7 @@ static bool metal_graph_alloc_raw_cap(
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_rank = layer->attn_q_a->dim[1];
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-    const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t low_dim = layer->attn_output_a->dim[1];
     const uint64_t group_dim = (uint64_t)DS4_N_HEAD_DIM * (DS4_N_HEAD / DS4_N_OUT_GROUP);
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
     const uint64_t routed_mid_dim = layer->ffn_gate_exps->dim[1];
@@ -14015,7 +14018,7 @@ static bool metal_graph_encode_decode_layer(
     const uint32_t n_groups = DS4_N_OUT_GROUP;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
-    const uint32_t rank = DS4_N_LORA_O;
+    const uint32_t rank = (uint32_t)(layer->attn_output_a->dim[1] / n_groups);
     const uint32_t shared_dim = (uint32_t)layer->ffn_gate_shexp->dim[1];
     const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
     const uint64_t expert_mid_dim = layer->ffn_gate_exps->dim[1];
@@ -14643,7 +14646,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok) {
         metal_graph_debug_dump_tensor("attn_out", g->attn_out, DS4_N_EMBD, il, pos);
     }
-    if (ok && metal_graph_directional_steering_attn_enabled(g)) {
+    if (ok && !ds4_tp_enabled(g->tp) && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
     }
     if (ok && !fuse_attn_out_hc) {
@@ -14896,10 +14899,10 @@ static bool metal_graph_encode_decode_layer(
         if (ok && keep_ffn_out) {
             metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
         }
-        if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        if (ok && !ds4_tp_enabled(g->tp) && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
         }
-        if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        if (ok && !ds4_tp_enabled(g->tp) && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
                                             g->ffn_out,
                                             g->after_attn_hc,
@@ -15084,10 +15087,10 @@ static bool metal_graph_encode_decode_layer(
         if (ok && keep_ffn_out) {
             metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
         }
-        if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        if (ok && !ds4_tp_enabled(g->tp) && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
         }
-        if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        if (ok && !ds4_tp_enabled(g->tp) && metal_graph_directional_steering_ffn_enabled(g)) {
             ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
                                             g->ffn_out,
                                             g->after_attn_hc,
@@ -15222,10 +15225,10 @@ static bool metal_graph_encode_decode_layer(
     if (ok && keep_ffn_out) {
         metal_graph_debug_dump_tensor("ffn_out", g->ffn_out, DS4_N_EMBD, il, pos);
     }
-    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+    if (ok && !ds4_tp_enabled(g->tp) && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_ffn(g, g->ffn_out, il, 1);
     }
-    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+    if (ok && !ds4_tp_enabled(g->tp) && metal_graph_directional_steering_ffn_enabled(g)) {
         ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
                                         g->ffn_out,
                                         g->after_attn_hc,
@@ -16527,7 +16530,7 @@ static bool metal_graph_encode_layer_attention_batch(
     const uint32_t n_groups = DS4_N_OUT_GROUP;
     const uint32_t group_heads = DS4_N_HEAD / n_groups;
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
-    const uint32_t rank = DS4_N_LORA_O;
+    const uint32_t rank = (uint32_t)(layer->attn_output_a->dim[1] / n_groups);
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
@@ -24647,7 +24650,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
                  load_layer_start,
                  load_layer_end,
                  load_output,
-                 load_output_optional);
+                 load_output_optional,
+                 opt->tp.enabled);
     if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
         const uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
         const uint64_t safe_cache_bytes =
@@ -25020,12 +25024,12 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_threads_shutdown();
     if (e->mtp_ready) model_close(&e->mtp_model);
     model_close(&e->model);
+    ds4_tp_ctx_destroy(e->tp);   /* must precede GPU cleanup — RCCL uses GPU */
 #ifndef DS4_NO_GPU
     ds4_gpu_cleanup();
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
-    ds4_tp_ctx_destroy(e->tp);
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
@@ -26074,6 +26078,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     const bool mtp_should_draft =
         probe_mtp && e->mtp_ready && s->mtp_logits &&
+        !ds4_tp_enabled(s->graph.tp) &&   /* MTP+TP speculation deferred */
         (e->mtp_draft_tokens > 1 || mtp_probe_log);
     if (probe_mtp && s->mtp_draft_valid) {
         if (mtp_probe_log) {

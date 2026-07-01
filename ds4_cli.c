@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_tp.h"
 #include "ds4_help.h"
 #include "linenoise.h"
 
@@ -1603,6 +1604,31 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);
+        } else if (!strcmp(arg, "--tp-rank")) {
+            c.engine.tp.rank = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.tp.enabled = true;
+        } else if (!strcmp(arg, "--tp-size")) {
+            c.engine.tp.tp_size = (uint32_t)parse_int(need_arg(&i, argc, argv, arg), arg);
+            c.engine.tp.enabled = true;
+        } else if (!strcmp(arg, "--tp-bootstrap")) {
+            static char tp_host_buf[256];
+            const char *val = need_arg(&i, argc, argv, arg);
+            const char *colon = strrchr(val, ':');
+            if (colon && colon != val) {
+                size_t hlen = (size_t)(colon - val);
+                if (hlen >= sizeof(tp_host_buf)) {
+                    fprintf(stderr, "ds4: --tp-bootstrap host too long\n");
+                    exit(2);
+                }
+                memcpy(tp_host_buf, val, hlen);
+                tp_host_buf[hlen] = '\0';
+                c.engine.tp.bootstrap_host = tp_host_buf;
+                c.engine.tp.bootstrap_port = parse_int(colon + 1, "--tp-bootstrap");
+            } else {
+                c.engine.tp.bootstrap_host = val;
+                c.engine.tp.bootstrap_port = 54321;
+            }
+            c.engine.tp.enabled = true;
         } else {
             fprintf(stderr, "ds4: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -1655,6 +1681,15 @@ int main(int argc, char **argv) {
         ds4_dist_options_free(cfg.dist);
         free(cfg.prompt_owned);
         return 1;
+    }
+    if (ds4_tp_enabled(ds4_engine_tp(engine)) && ds4_tp_rank(ds4_engine_tp(engine)) > 0) {
+        char tp_err[256];
+        int rc = ds4_tp_worker_run(ds4_engine_tp(engine), engine, cfg.gen.ctx_size, tp_err, sizeof(tp_err));
+        if (rc != 0) fprintf(stderr, "ds4-tp: worker error: %s\n", tp_err);
+        ds4_engine_close(engine);
+        ds4_dist_options_free(cfg.dist);
+        free(cfg.prompt_owned);
+        return rc;
     }
     if (cfg.dist && cfg.dist->role == DS4_DISTRIBUTED_WORKER) {
         ds4_dist_generation_options dist_gen = {

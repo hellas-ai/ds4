@@ -108,7 +108,7 @@ typedef struct {
  * Blocks until DS4_TP_MSG_SHUTDOWN is received.
  */
 int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
-                      char *err, size_t errlen);
+                      int ctx_size, char *err, size_t errlen);
 
 /*
  * Rank 0 helpers called from ds4_server / inference loop.
