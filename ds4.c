@@ -14652,7 +14652,7 @@ static bool metal_graph_encode_decode_layer(
     if (ok && !fuse_attn_out_hc) {
         if (ds4_tp_enabled(g->tp)) {
             char _tp_err[256];
-            if (ds4_tp_allreduce_f32(g->tp, (float *)g->attn_out->ptr,
+            if (ds4_tp_allreduce_f32(g->tp, (float *)ds4_gpu_tensor_contents(g->attn_out),
                                      DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
                 fprintf(stderr, "ds4-tp: attn allreduce: %s\n", _tp_err);
                 ok = false;
@@ -14916,7 +14916,7 @@ static bool metal_graph_encode_decode_layer(
                      ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
                 if (ok) {
                     char _tp_err[256];
-                    if (ds4_tp_allreduce_f32(g->tp, (float *)g->ffn_out->ptr,
+                    if (ds4_tp_allreduce_f32(g->tp, (float *)ds4_gpu_tensor_contents(g->ffn_out),
                                              DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
                         fprintf(stderr, "ds4-tp: ffn allreduce: %s\n", _tp_err);
                         ok = false;
@@ -15104,7 +15104,7 @@ static bool metal_graph_encode_decode_layer(
                      ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
                 if (ok) {
                     char _tp_err[256];
-                    if (ds4_tp_allreduce_f32(g->tp, (float *)g->ffn_out->ptr,
+                    if (ds4_tp_allreduce_f32(g->tp, (float *)ds4_gpu_tensor_contents(g->ffn_out),
                                              DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
                         fprintf(stderr, "ds4-tp: ffn allreduce: %s\n", _tp_err);
                         ok = false;
@@ -15242,7 +15242,7 @@ static bool metal_graph_encode_decode_layer(
                  ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
             if (ok) {
                 char _tp_err[256];
-                if (ds4_tp_allreduce_f32(g->tp, (float *)g->ffn_out->ptr,
+                if (ds4_tp_allreduce_f32(g->tp, (float *)ds4_gpu_tensor_contents(g->ffn_out),
                                          DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
                     fprintf(stderr, "ds4-tp: ffn allreduce: %s\n", _tp_err);
                     ok = false;
@@ -25624,6 +25624,9 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
  *
  * A non-matching prompt discards the checkpoint and prefills from token zero.
  */
+static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
+                                     char *err, size_t errlen);
+
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt || prompt->len <= 0 || prompt->len >= s->ctx_size) {
         snprintf(err, errlen, "prompt exceeds context");
