@@ -34,7 +34,7 @@
 
 #ifdef __HIP_PLATFORM_AMD__
 #include <hip/hip_runtime.h>
-#include <rccl.h>
+#include <rccl/rccl.h>
 #define DS4_TP_HAVE_RCCL 1
 #else
 /* Stub types for non-ROCm builds (e.g. macOS Metal build). TP requires ROCm. */
