@@ -27,7 +27,7 @@ CPPFLAGS ?= -D_GNU_SOURCE
 
 .PHONY: all clean quality-score
 
-all: deepseek4-quantize ds4-tp-shard
+all: deepseek4-quantize ds4-tp-shard ds4-shard-f16-fix
 
 deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ deepseek4-quantize.c quants.c -lm -pthread
@@ -35,9 +35,12 @@ deepseek4-quantize: deepseek4-quantize.c quants.c quants.h
 ds4-tp-shard: ds4-tp-shard.c quants.c quants.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ ds4-tp-shard.c quants.c -lm
 
+ds4-shard-f16-fix: ds4-shard-f16-fix.c quants.c quants.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ ds4-shard-f16-fix.c quants.c -lm
+
 quality-score:
 	$(MAKE) -C .. $(QUALITY_TARGETS)
 	$(QUALITY_LINK) quality-testing/score_official quality-testing/score_official.c $(QUALITY_OBJS) $(QUALITY_LDLIBS)
 
 clean:
-	rm -f deepseek4-quantize ds4-tp-shard quality-testing/score_official
+	rm -f deepseek4-quantize ds4-tp-shard ds4-shard-f16-fix quality-testing/score_official

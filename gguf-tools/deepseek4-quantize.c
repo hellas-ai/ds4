@@ -1000,6 +1000,30 @@ static bool is_attention_tensor(const char *name) {
     return strstr(name, ".attn") || strstr(name, "attn_") || strstr(name, ".indexer") || strstr(name, "indexer_");
 }
 
+/* Tensors that must be stored as F16 regardless of --attention type,
+ * because the Metal graph engine reads them as raw F16 bytes. */
+static bool must_be_f16(const char *name) {
+    static const char * const suffixes[] = {
+        "attn_compressor_kv.weight",
+        "attn_compressor_gate.weight",
+        "attn_compressor_ape.weight",
+        "indexer_compressor_kv.weight",
+        "indexer_compressor_gate.weight",
+        "indexer_compressor_ape.weight",
+        "indexer.proj.weight",
+        "hc_attn_fn.weight",
+        "hc_ffn_fn.weight",
+        "output_hc_fn.weight",
+        NULL
+    };
+    size_t nlen = strlen(name);
+    for (const char * const *s = suffixes; *s; s++) {
+        size_t slen = strlen(*s);
+        if (nlen >= slen && memcmp(name + nlen - slen, *s, slen) == 0) return true;
+    }
+    return false;
+}
+
 static bool is_shared_expert(const char *name) {
     return strstr(name, "_shexp.") != NULL;
 }
@@ -1042,6 +1066,7 @@ static ds4q_type policy_type(const quant_policy *p, const char *name, const tens
         return tmpl->type;
     }
     if (tensor_n_dims(tmpl) <= 1) return tmpl->type;
+    if (must_be_f16(name)) return DS4Q_TYPE_F16;  /* compressor/HC projections must stay F16 */
     if (strcmp(name, "token_embd.weight") == 0 && p->embedding != DS4Q_TYPE_COUNT) return p->embedding;
     if (is_output_tensor(name) && p->output != DS4Q_TYPE_COUNT) return p->output;
     if (is_shared_expert(name) && p->shared != DS4Q_TYPE_COUNT) return p->shared;

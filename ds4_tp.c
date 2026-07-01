@@ -220,6 +220,12 @@ static int tp_rank0_bootstrap(ds4_tp_ctx *tp, const ds4_tp_options *opt,
             close(cfd); close(listen_fd);
             return tp_err(err, errlen, "TP rank 0: bad peer rank %u", hello.rank);
         }
+        if (tp->peer_fds[hello.rank - 1] != 0) {
+            fprintf(stderr, "ds4-tp: rank 0 duplicate connection for rank %u, rejecting\n",
+                    hello.rank);
+            close(cfd); close(listen_fd);
+            return tp_err(err, errlen, "TP rank 0: duplicate rank %u", hello.rank);
+        }
         tp->peer_fds[hello.rank - 1] = cfd;
         fprintf(stderr, "ds4-tp: rank 0 accepted rank %u\n", hello.rank);
         connected++;
@@ -331,7 +337,13 @@ int ds4_tp_ctx_create(ds4_tp_ctx **out, const ds4_tp_options *opt,
     /* Apply defaults. */
     ds4_tp_options eff = *opt;
     if (eff.bootstrap_port == 0) eff.bootstrap_port = 54321;
-    if (!eff.bootstrap_host || !eff.bootstrap_host[0]) eff.bootstrap_host = "127.0.0.1";
+    if (!eff.bootstrap_host || !eff.bootstrap_host[0]) {
+        if (eff.rank != 0) {
+            return tp_err(err, errlen,
+                "TP: bootstrap_host must be set to rank 0's IP address on multi-node clusters");
+        }
+        eff.bootstrap_host = "0.0.0.0";
+    }
 
     int rc;
     if (eff.rank == 0)
@@ -458,7 +470,7 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
 
     fprintf(stderr, "ds4-tp: rank %u worker loop started\n", tp->rank);
 
-    int pos_before_draft = 0;  /* position saved at start of DRAFT batch */
+    int pos_before_draft = -1;  /* -1 = no draft in flight */
 
     for (;;) {
         ds4_tp_frame hdr;
@@ -477,7 +489,8 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
             if (ds4_session_eval(sess, step.token, eval_err, sizeof(eval_err)) != 0) {
                 fprintf(stderr, "ds4-tp: rank %u TOKEN eval error: %s\n", tp->rank, eval_err);
 #if DS4_TP_HAVE_RCCL
-                ncclCommAbort(tp->comm);  /* unblock other ranks stuck in allreduce */
+                ncclCommAbort(tp->comm);
+                tp->comm_ready = false;
 #endif
                 goto done;
             }
@@ -495,6 +508,7 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
                     fprintf(stderr, "ds4-tp: rank %u DRAFT eval error: %s\n", tp->rank, eval_err);
 #if DS4_TP_HAVE_RCCL
                     ncclCommAbort(tp->comm);
+                    tp->comm_ready = false;
 #endif
                     goto done;
                 }
@@ -505,10 +519,15 @@ int ds4_tp_worker_run(ds4_tp_ctx *tp, struct ds4_engine *engine,
             ds4_tp_accept accept;
             if (hdr.bytes != sizeof(accept)) break;
             memcpy(&accept, buf, sizeof(accept));
-            /* Rewind to pos_before_draft + n_accepted tokens of draft. */
+            if (pos_before_draft < 0) {
+                fprintf(stderr, "ds4-tp: rank %u ACCEPT without prior DRAFT, ignoring\n",
+                        tp->rank);
+                break;
+            }
             int target = pos_before_draft + (int)accept.n_accepted;
             if (target < ds4_session_pos(sess))
                 ds4_session_rewind(sess, target);
+            pos_before_draft = -1;
             break;
         }
         case DS4_TP_MSG_RESET:

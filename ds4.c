@@ -14256,7 +14256,17 @@ static bool metal_graph_encode_decode_layer(
             layer->attn_compressor_gate->dim[0] != DS4_N_EMBD ||
             layer->attn_compressor_kv->dim[1] != comp_width ||
             layer->attn_compressor_gate->dim[1] != comp_width) {
-            fprintf(stderr, "ds4: Metal graph compressor expects paired F16 compressor projections\n");
+            fprintf(stderr,
+                "ds4: Metal graph compressor expects paired F16 compressor projections "
+                "(layer=%u ratio=%u comp_width=%u kv_type=%u kv_dim=[%" PRId64 ",%" PRId64 "] "
+                "gate_type=%u gate_dim=[%" PRId64 ",%" PRId64 "])\n",
+                il, ratio, comp_width,
+                layer->attn_compressor_kv  ? layer->attn_compressor_kv->type  : 0xFFFFFFFFu,
+                layer->attn_compressor_kv  ? layer->attn_compressor_kv->dim[0]  : -1,
+                layer->attn_compressor_kv  ? layer->attn_compressor_kv->dim[1]  : -1,
+                layer->attn_compressor_gate ? layer->attn_compressor_gate->type : 0xFFFFFFFFu,
+                layer->attn_compressor_gate ? layer->attn_compressor_gate->dim[0] : -1,
+                layer->attn_compressor_gate ? layer->attn_compressor_gate->dim[1] : -1);
             ok = false;
         }
         if (ok && emit && g->layer_n_comp[il] >= g->layer_comp_cap[il]) {
