@@ -38,6 +38,7 @@
 
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_tp.h"
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
@@ -10371,6 +10372,7 @@ typedef struct {
     bool streaming_static_decode_map_current;
     bool mtp_enabled;
     float *cpu_router_norm;
+    ds4_tp_ctx *tp;
 } ds4_gpu_graph;
 
 static bool graph_power_throttle_enabled(const ds4_gpu_graph *g) {
@@ -14596,7 +14598,8 @@ static bool metal_graph_encode_decode_layer(
     }
     const bool fuse_attn_out_hc =
         !metal_graph_directional_steering_attn_enabled(g) &&
-        !metal_graph_use_reference_attn_out_hc();
+        !metal_graph_use_reference_attn_out_hc() &&
+        !ds4_tp_enabled(g->tp);
     if (ok && fuse_attn_out_hc) {
         ok = ds4_gpu_attention_output_low_q8_tensor(g->attn_low,
                                                       model->map,
@@ -14644,8 +14647,16 @@ static bool metal_graph_encode_decode_layer(
         ok = metal_graph_apply_directional_steering_attn(g, g->attn_out, il, 1);
     }
     if (ok && !fuse_attn_out_hc) {
-        ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
-                                        g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
+        if (ds4_tp_enabled(g->tp)) {
+            char _tp_err[256];
+            if (ds4_tp_allreduce_f32(g->tp, (float *)g->attn_out->ptr,
+                                     DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
+                fprintf(stderr, "ds4-tp: attn allreduce: %s\n", _tp_err);
+                ok = false;
+            }
+        }
+        if (ok) ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
+                                                g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
     }
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
     if (ok) {
@@ -14757,7 +14768,8 @@ static bool metal_graph_encode_decode_layer(
         getenv("DS4_METAL_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
 #endif
     const bool fuse_shared_down_hc =
-        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc();
+        !keep_ffn_out && !metal_graph_use_reference_shared_down_hc() &&
+        !ds4_tp_enabled(g->tp);
     const bool q4_selected_shared_overlap =
         metal_graph_use_q4_selected_shared_overlap() &&
         metal_graph_decode_q4_selected_slots_expected(g,
@@ -14896,13 +14908,31 @@ static bool metal_graph_encode_decode_layer(
                                             DS4_N_EMBD,
                                             DS4_N_HC) != 0;
         } else if (ok && !fuse_shared_down_hc) {
-            ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
-                                                      g->routed_out,
-                                                      g->shared_out,
-                                                      g->after_attn_hc,
-                                                      g->hc_split,
-                                                      DS4_N_EMBD,
-                                                      DS4_N_HC) != 0;
+            if (ds4_tp_enabled(g->tp)) {
+                ok = metal_graph_ensure_ffn_out(g) &&
+                     ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+                if (ok) {
+                    char _tp_err[256];
+                    if (ds4_tp_allreduce_f32(g->tp, (float *)g->ffn_out->ptr,
+                                             DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
+                        fprintf(stderr, "ds4-tp: ffn allreduce: %s\n", _tp_err);
+                        ok = false;
+                    }
+                }
+                if (ok) ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
+                                                        g->ffn_out,
+                                                        g->after_attn_hc,
+                                                        g->hc_post, g->hc_comb,
+                                                        DS4_N_EMBD, DS4_N_HC) != 0;
+            } else {
+                ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
+                                                          g->routed_out,
+                                                          g->shared_out,
+                                                          g->after_attn_hc,
+                                                          g->hc_split,
+                                                          DS4_N_EMBD,
+                                                          DS4_N_HC) != 0;
+            }
         }
         DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
         if (ok) {
@@ -15066,13 +15096,31 @@ static bool metal_graph_encode_decode_layer(
                                             DS4_N_EMBD,
                                             DS4_N_HC) != 0;
         } else if (ok && !fuse_shared_down_hc) {
-            ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
-                                                      g->routed_out,
-                                                      g->shared_out,
-                                                      g->after_attn_hc,
-                                                      g->hc_split,
-                                                      DS4_N_EMBD,
-                                                      DS4_N_HC) != 0;
+            if (ds4_tp_enabled(g->tp)) {
+                ok = metal_graph_ensure_ffn_out(g) &&
+                     ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+                if (ok) {
+                    char _tp_err[256];
+                    if (ds4_tp_allreduce_f32(g->tp, (float *)g->ffn_out->ptr,
+                                             DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
+                        fprintf(stderr, "ds4-tp: ffn allreduce: %s\n", _tp_err);
+                        ok = false;
+                    }
+                }
+                if (ok) ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
+                                                        g->ffn_out,
+                                                        g->after_attn_hc,
+                                                        g->hc_post, g->hc_comb,
+                                                        DS4_N_EMBD, DS4_N_HC) != 0;
+            } else {
+                ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
+                                                          g->routed_out,
+                                                          g->shared_out,
+                                                          g->after_attn_hc,
+                                                          g->hc_split,
+                                                          DS4_N_EMBD,
+                                                          DS4_N_HC) != 0;
+            }
         }
         DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
         if (ok) {
@@ -15186,13 +15234,31 @@ static bool metal_graph_encode_decode_layer(
                                         DS4_N_EMBD,
                                         DS4_N_HC) != 0;
     } else if (ok && !fuse_shared_down_hc) {
-        ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
-                                                  g->routed_out,
-                                                  g->shared_out,
-                                                  g->after_attn_hc,
-                                                  g->hc_split,
-                                                  DS4_N_EMBD,
-                                                  DS4_N_HC) != 0;
+        if (ds4_tp_enabled(g->tp)) {
+            ok = metal_graph_ensure_ffn_out(g) &&
+                 ds4_gpu_add_tensor(g->ffn_out, g->shared_out, g->routed_out, DS4_N_EMBD) != 0;
+            if (ok) {
+                char _tp_err[256];
+                if (ds4_tp_allreduce_f32(g->tp, (float *)g->ffn_out->ptr,
+                                         DS4_N_EMBD, _tp_err, sizeof(_tp_err)) != 0) {
+                    fprintf(stderr, "ds4-tp: ffn allreduce: %s\n", _tp_err);
+                    ok = false;
+                }
+            }
+            if (ok) ok = ds4_gpu_hc_expand_tensor(g->after_ffn_hc,
+                                                    g->ffn_out,
+                                                    g->after_attn_hc,
+                                                    g->hc_post, g->hc_comb,
+                                                    DS4_N_EMBD, DS4_N_HC) != 0;
+        } else {
+            ok = ds4_gpu_hc_expand_add_split_tensor(g->after_ffn_hc,
+                                                      g->routed_out,
+                                                      g->shared_out,
+                                                      g->after_attn_hc,
+                                                      g->hc_split,
+                                                      DS4_N_EMBD,
+                                                      DS4_N_HC) != 0;
+        }
     }
     DS4_METAL_PROFILE_DECODE_STAGE("ffn_hc_post");
 #undef DS4_METAL_PROFILE_DECODE_STAGE
@@ -20818,6 +20884,7 @@ struct ds4_engine {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     ds4_distributed_options distributed;
+    ds4_tp_ctx *tp;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -24877,6 +24944,22 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
 #endif
 
+    if (opt->tp.enabled) {
+        ds4_tp_options tp_opt = {
+            .enabled        = opt->tp.enabled,
+            .rank           = opt->tp.rank,
+            .tp_size        = opt->tp.tp_size,
+            .bootstrap_host = opt->tp.bootstrap_host,
+            .bootstrap_port = opt->tp.bootstrap_port,
+        };
+        char tp_err[256];
+        if (ds4_tp_ctx_create(&e->tp, &tp_opt, tp_err, sizeof(tp_err)) != 0) {
+            fprintf(stderr, "ds4: TP init failed: %s\n", tp_err);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+    }
     *out = e;
     return 0;
 }
@@ -24938,6 +25021,7 @@ void ds4_engine_close(ds4_engine *e) {
 #endif
     ds4_ssd_memory_lock_release(&e->simulated_memory);
     ds4_release_instance_lock();
+    ds4_tp_ctx_destroy(e->tp);
     free(e->directional_steering_dirs);
     free(e->directional_steering_file);
     free(e);
@@ -24989,6 +25073,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     s->graph.ssd_streaming_cold = e->ssd_streaming_cold;
     s->graph.streaming_preload_experts = e->ssd_streaming_preload_experts;
     s->graph.power_percent = (uint32_t)e->power_percent;
+    s->graph.tp = e->tp;
     if (!metal_graph_load_directional_steering(&s->graph,
                                                e->directional_steering_file,
                                                e->directional_steering_attn_scale,

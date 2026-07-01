@@ -118,6 +118,14 @@ typedef struct {
     uint32_t load_layer_end;
     bool load_output;
     ds4_distributed_options distributed;
+    /* Tensor parallelism. Mutually exclusive with distributed (PP). */
+    struct {
+        bool     enabled;
+        uint32_t rank;
+        uint32_t tp_size;
+        const char *bootstrap_host;
+        int          bootstrap_port;
+    } tp;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);

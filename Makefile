@@ -34,7 +34,10 @@ CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrccl
+ROCM_TP_CFLAGS ?= -O3 -ffast-math -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument
+DS4_TP_CC ?= $(CC)
+DS4_TP_CFLAGS ?= $(CFLAGS)
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
@@ -106,8 +109,10 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o" \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_ssd.o ds4_rocm.o ds4_tp.o" \
 		CFLAGS="$(CFLAGS) -DDS4_ROCM_BUILD" \
+		DS4_TP_CC="$(HIPCC)" \
+		DS4_TP_CFLAGS="$(ROCM_TP_CFLAGS)" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
@@ -139,8 +144,11 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_tp.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_tp.o: ds4_tp.c ds4_tp.h
+	$(DS4_TP_CC) $(DS4_TP_CFLAGS) -c -o $@ ds4_tp.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
