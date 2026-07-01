@@ -11672,7 +11672,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cpu")) {
             c.engine.backend = DS4_BACKEND_CPU;
         } else if (!strcmp(arg, "--tp-rank")) {
-            c.engine.tp.rank = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.tp.rank = (uint32_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
             c.engine.tp.enabled = true;
         } else if (!strcmp(arg, "--tp-size")) {
             c.engine.tp.tp_size = (uint32_t)parse_int_arg(need_arg(&i, argc, argv, arg), arg);
