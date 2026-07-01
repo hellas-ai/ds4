@@ -246,10 +246,143 @@ static int routed_moe_q2_float_down_launch(
     return cuda_ok(cudaGetLastError(), "routed_moe iq2/q2 float-down sum launch");
 }
 
+__global__ static void routed_moe_q8_decode_accum_kernel(
+        float *out,
+        const float *down,
+        const float *weights,
+        uint32_t slot,
+        uint32_t out_dim) {
+    const uint32_t i = (uint32_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_dim) return;
+    const float v = down[i] * weights[slot];
+    if (slot == 0u) out[i] = v;
+    else out[i] += v;
+}
+
+static int routed_moe_q8_decode_launch(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t gate_offset,
+        uint64_t up_offset,
+        uint64_t down_offset,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp,
+        const ds4_gpu_tensor *x) {
+    if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
+        n_total_expert == 0u || n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
+        expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u ||
+        !cuda_tensor_has_elems2(x, 1u, expert_in_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(selected, 1u, n_expert, sizeof(int32_t)) ||
+        !cuda_tensor_has_elems2(weights, 1u, n_expert, sizeof(float)) ||
+        !cuda_tensor_has_elems3(gate, 1u, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(up, 1u, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(mid, 1u, n_expert, expert_mid_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems3(down, 1u, n_expert, out_dim, sizeof(float)) ||
+        !cuda_tensor_has_elems2(out, 1u, out_dim, sizeof(float))) {
+        return 0;
+    }
+
+    const uint64_t gate_blocks = (expert_in_dim + 31u) / 32u;
+    const uint64_t down_blocks = (expert_mid_dim + 31u) / 32u;
+    uint64_t expected_gate_row_bytes = 0, expected_down_row_bytes = 0;
+    uint64_t expected_gate_expert_bytes = 0, expected_down_expert_bytes = 0;
+    if (!cuda_u64_mul_checked(gate_blocks, 34u, &expected_gate_row_bytes) ||
+        !cuda_u64_mul_checked(down_blocks, 34u, &expected_down_row_bytes) ||
+        !cuda_u64_mul_checked(expected_gate_row_bytes, expert_mid_dim, &expected_gate_expert_bytes) ||
+        !cuda_u64_mul_checked(expected_down_row_bytes, out_dim, &expected_down_expert_bytes) ||
+        gate_row_bytes != expected_gate_row_bytes ||
+        down_row_bytes != expected_down_row_bytes ||
+        gate_expert_bytes != expected_gate_expert_bytes ||
+        down_expert_bytes != expected_down_expert_bytes) {
+        return 0;
+    }
+
+    int32_t h_selected[DS4_ROCM_N_EXPERT_USED] = {0};
+    if (!cuda_ok(cudaMemcpy(h_selected, selected->ptr,
+                            (uint64_t)n_expert * sizeof(h_selected[0]),
+                            cudaMemcpyDeviceToHost),
+                 "routed_moe q8 selected copy")) {
+        return 0;
+    }
+
+    const uint64_t mid_bytes = (uint64_t)expert_mid_dim * sizeof(float);
+    const uint64_t out_bytes = (uint64_t)out_dim * sizeof(float);
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        int32_t expert_i = h_selected[slot];
+        if (expert_i < 0) expert_i = 0;
+        const uint32_t expert = (uint32_t)expert_i;
+        if (expert >= n_total_expert) return 0;
+
+        uint64_t gate_delta = 0, down_delta = 0;
+        if (!cuda_u64_mul_checked(expert, gate_expert_bytes, &gate_delta) ||
+            !cuda_u64_mul_checked(expert, down_expert_bytes, &down_delta) ||
+            gate_delta > UINT64_MAX - gate_offset ||
+            gate_delta > UINT64_MAX - up_offset ||
+            down_delta > UINT64_MAX - down_offset) {
+            return 0;
+        }
+        const uint64_t expert_gate_offset = gate_offset + gate_delta;
+        const uint64_t expert_up_offset = up_offset + gate_delta;
+        const uint64_t expert_down_offset = down_offset + down_delta;
+
+        const uint64_t mid_slice_off = (uint64_t)slot * mid_bytes;
+        const uint64_t out_slice_off = (uint64_t)slot * out_bytes;
+        ds4_gpu_tensor gate_slice = { (char *)gate->ptr + mid_slice_off, mid_bytes, 0 };
+        ds4_gpu_tensor up_slice = { (char *)up->ptr + mid_slice_off, mid_bytes, 0 };
+        ds4_gpu_tensor mid_slice = { (char *)mid->ptr + mid_slice_off, mid_bytes, 0 };
+        ds4_gpu_tensor down_slice = { (char *)down->ptr + out_slice_off, out_bytes, 0 };
+
+        if (!ds4_gpu_matmul_q8_0_tensor(&gate_slice, model_map, model_size,
+                                        expert_gate_offset, expert_in_dim,
+                                        expert_mid_dim, x, 1)) {
+            return 0;
+        }
+        if (!ds4_gpu_matmul_q8_0_tensor(&up_slice, model_map, model_size,
+                                        expert_up_offset, expert_in_dim,
+                                        expert_mid_dim, x, 1)) {
+            return 0;
+        }
+        if (!ds4_gpu_swiglu_tensor(&mid_slice, &gate_slice, &up_slice,
+                                   expert_mid_dim, clamp, 1.0f)) {
+            return 0;
+        }
+        if (!ds4_gpu_matmul_q8_0_tensor(&down_slice, model_map, model_size,
+                                        expert_down_offset, expert_mid_dim,
+                                        out_dim, &mid_slice, 1)) {
+            return 0;
+        }
+
+        routed_moe_q8_decode_accum_kernel<<<(out_dim + 255u) / 256u, 256>>>(
+                (float *)out->ptr,
+                (const float *)down_slice.ptr,
+                (const float *)weights->ptr,
+                slot,
+                out_dim);
+        if (!cuda_ok(cudaGetLastError(), "routed_moe q8 decode accum launch")) return 0;
+    }
+    return 1;
+}
+
 typedef struct {
     int q4k_path;
     int iq2_path;
     int q2k_path;
+    int q8_path;
     uint64_t gate_bytes;
     uint64_t down_bytes;
 } routed_moe_launch_plan;
@@ -281,11 +414,16 @@ static int routed_moe_build_plan(
         routed_moe_launch_plan *plan) {
     if (!plan) return 0;
     memset(plan, 0, sizeof(*plan));
+    const int q4k_path = (gate_type == 12u && down_type == 12u);
+    const int iq2_path = (gate_type == 16u && down_type == 10u);
+    const int q2k_path = (gate_type == 10u && down_type == 10u);
+    const int q8_path = (gate_type == 8u && down_type == 8u);
+    const uint32_t quant_align = q8_path ? 32u : CUDA_QK_K;
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0u ||
         n_expert == 0u || n_expert > DS4_ROCM_N_EXPERT_USED ||
         expert_in_dim == 0u || expert_mid_dim == 0u || out_dim == 0u ||
-        expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
+        expert_in_dim % quant_align != 0 || expert_mid_dim % quant_align != 0 ||
         !cuda_tensor_has_elems2(x, n_tokens, expert_in_dim, sizeof(float)) ||
         !cuda_tensor_has_elems2(selected, n_tokens, n_expert, sizeof(int32_t)) ||
         !cuda_tensor_has_elems2(weights, n_tokens, n_expert, sizeof(float)) ||
@@ -296,10 +434,11 @@ static int routed_moe_build_plan(
         !cuda_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
         return 0;
     }
-    plan->q4k_path = (gate_type == 12u && down_type == 12u);
-    plan->iq2_path = (gate_type == 16u && down_type == 10u);
-    plan->q2k_path = (gate_type == 10u && down_type == 10u);
-    if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path) return 0;
+    plan->q4k_path = q4k_path;
+    plan->iq2_path = iq2_path;
+    plan->q2k_path = q2k_path;
+    plan->q8_path = q8_path;
+    if (!plan->q4k_path && !plan->iq2_path && !plan->q2k_path && !plan->q8_path) return 0;
     if (!cuda_u64_mul_checked(n_total_expert, gate_expert_bytes, &plan->gate_bytes) ||
         !cuda_u64_mul_checked(n_total_expert, down_expert_bytes, &plan->down_bytes) ||
         !cuda_model_range_fits(model_size, gate_offset, plan->gate_bytes) ||
@@ -348,8 +487,21 @@ static int routed_moe_launch(
     const int q4k_path = plan.q4k_path;
     const int iq2_path = plan.iq2_path;
     const int q2k_path = plan.q2k_path;
+    const int q8_path = plan.q8_path;
     const uint64_t gate_bytes = plan.gate_bytes;
     const uint64_t down_bytes = plan.down_bytes;
+
+    if (q8_path) {
+        if (n_tokens != 1u) return 0;
+        return routed_moe_q8_decode_launch(
+                out, gate, up, mid, down, model_map, model_size,
+                gate_offset, up_offset, down_offset,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected, weights, n_total_expert, n_expert, clamp, x);
+    }
+
     const char *gate_w = cuda_model_range_ptr(model_map, gate_offset, gate_bytes, "moe_gate");
     const char *up_w = cuda_model_range_ptr(model_map, up_offset, gate_bytes, "moe_up");
     const char *down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
